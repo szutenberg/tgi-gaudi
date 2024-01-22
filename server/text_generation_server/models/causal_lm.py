@@ -202,7 +202,7 @@ class CausalLMBatch(Batch):
 
         grouped_requests = [[req for req in batch.requests] for batch in batches]
         flat_requests = list(itertools.chain(*grouped_requests))
-        if inplace and scenario != 'SHIFT':
+        if inplace:
             # The data is already present in the batch. No need to move it
             grouped_requests[target_batch_idx] = []
             free_indices = batches[target_batch_idx].free_indices()
