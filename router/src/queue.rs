@@ -3,7 +3,8 @@ use crate::infer::InferStreamResponse;
 use crate::validation::ValidGenerateRequest;
 use nohash_hasher::{BuildNoHashHasher, IntMap};
 use std::cmp::min;
-use std::collections::VecDeque;
+use std::cmp::{Eq, Ord, PartialEq, PartialOrd};
+use std::collections::BinaryHeap;
 use text_generation_client::{Batch, Request};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
@@ -132,11 +133,45 @@ async fn queue_task(
     }
 }
 
+#[derive(Debug)]
+struct IdentifiableEntry(u64, Entry);
+
+impl Eq for IdentifiableEntry {}
+
+impl PartialEq for IdentifiableEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+
+impl Ord for IdentifiableEntry {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        let ordering = match self
+            .1
+            .request
+            .input_length
+            .cmp(&other.1.request.input_length)
+        {
+            std::cmp::Ordering::Equal => self.0.cmp(&other.0),
+            any => any,
+        };
+
+        // inverse to get min heap
+        return ordering.reverse();
+    }
+}
+
+impl PartialOrd for IdentifiableEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 /// Queue State
 #[derive(Debug)]
 struct State {
     /// Queue entries organized in a Vec
-    entries: VecDeque<(u64, Entry)>,
+    entries: BinaryHeap<IdentifiableEntry>,
 
     /// Id of the next entry
     next_id: u64,
@@ -169,7 +204,7 @@ impl State {
         window_size: Option<u32>
     ) -> Self {
         Self {
-            entries: VecDeque::with_capacity(128),
+            entries: BinaryHeap::with_capacity(128),
             next_id: 0,
             next_batch_id: 0,
             requires_padding,
@@ -187,7 +222,7 @@ impl State {
         entry.temp_span = Some(queue_span);
 
         // Push entry in the queue
-        self.entries.push_back((self.next_id, entry));
+        self.entries.push(IdentifiableEntry(self.next_id, entry));
         self.next_id += 1;
     }
 
@@ -221,7 +256,10 @@ impl State {
         let mut decode_tokens: u32 = 0;
 
         // Pop entries starting from the front of the queue
-        while let Some((id, mut entry)) = self.entries.pop_front() {
+        while let Some(id_entry) = self.entries.pop() {
+            let id = id_entry.0;
+            let mut entry = id_entry.1;
+
             // Filter entries where the response receiver was dropped (== entries where the request
             // was dropped by the client)
             if entry.response_tx.is_closed() {
@@ -263,7 +301,7 @@ impl State {
             {
                 // Entry is over budget
                 // Add it back to the front
-                self.entries.push_front((id, entry));
+                self.entries.push(IdentifiableEntry(id, entry));
                 break;
             }
 
@@ -303,7 +341,7 @@ impl State {
                 for r in batch_requests.into_iter().rev() {
                     let id = r.id;
                     let entry = batch_entries.remove(&id).unwrap();
-                    self.entries.push_front((id, entry));
+                    self.entries.push(IdentifiableEntry(id, entry));
                 }
 
                 return None;
@@ -399,7 +437,7 @@ mod tests {
 
         assert_eq!(state.next_id, 1);
         assert_eq!(state.entries.len(), 1);
-        let (id, _) = state.entries.remove(0).unwrap();
+        let id = state.entries.pop().unwrap().0;
         assert_eq!(id, 0);
     }
 
