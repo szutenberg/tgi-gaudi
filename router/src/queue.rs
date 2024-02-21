@@ -5,6 +5,8 @@ use nohash_hasher::{BuildNoHashHasher, IntMap};
 use std::cmp::min;
 use std::cmp::{Eq, Ord, PartialEq, PartialOrd};
 use std::collections::BinaryHeap;
+use std::env;
+use std::time::Duration;
 use text_generation_client::{Batch, Request};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
@@ -167,11 +169,68 @@ impl PartialOrd for IdentifiableEntry {
     }
 }
 
+#[derive(Debug)]
+struct QueueImpl {
+    regular_entries: BinaryHeap<IdentifiableEntry>,
+    overdue_entries: BinaryHeap<IdentifiableEntry>,
+    overdue_threshold: Duration,
+}
+
+impl QueueImpl {
+    fn new(capacity: usize, overdue_threshold: Duration) -> Self {
+        Self {
+            regular_entries: BinaryHeap::with_capacity(capacity),
+            overdue_entries: BinaryHeap::with_capacity(capacity),
+            overdue_threshold,
+        }
+    }
+
+    fn update(&mut self) {
+        if self.regular_entries.is_empty() {
+            return;
+        }
+
+        let mut left = BinaryHeap::with_capacity(self.regular_entries.capacity());
+
+        for entry in self.regular_entries.drain() {
+            if entry.1.queue_time.elapsed() > self.overdue_threshold {
+                self.overdue_entries.push(entry);
+            } else {
+                left.push(entry);
+            }
+        }
+
+        self.regular_entries = left;
+    }
+
+    fn push(&mut self, entry: IdentifiableEntry) {
+        if entry.1.queue_time.elapsed() > self.overdue_threshold {
+            self.overdue_entries.push(entry);
+        } else {
+            self.regular_entries.push(entry);
+        }
+    }
+
+    fn pop(&mut self) -> Option<IdentifiableEntry> {
+        if !self.overdue_entries.is_empty() {
+            self.overdue_entries.pop()
+        } else {
+            self.regular_entries.pop()
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.regular_entries.is_empty() && self.overdue_entries.is_empty()
+    }
+    fn len(&self) -> usize {
+        self.regular_entries.len() + self.overdue_entries.len()
+    }
+}
 /// Queue State
 #[derive(Debug)]
 struct State {
-    /// Queue entries organized in a Vec
-    entries: BinaryHeap<IdentifiableEntry>,
+    /// Queue entries
+    entries: QueueImpl,
 
     /// Id of the next entry
     next_id: u64,
@@ -201,10 +260,16 @@ impl State {
         max_input_length: u32,
         max_total_tokens: u32,
         block_size: u32,
-        window_size: Option<u32>
+        window_size: Option<u32>,
     ) -> Self {
+        let default_threshold: u64 = 120;
+        let threshold: u64 = match env::var("QUEUE_THREASHOLD_MS") {
+            Ok(val) => val.parse().unwrap_or(default_threshold),
+            Err(_) => default_threshold,
+        };
+
         Self {
-            entries: BinaryHeap::with_capacity(128),
+            entries: QueueImpl::new(128, Duration::from_millis(threshold)),
             next_id: 0,
             next_batch_id: 0,
             requires_padding,
@@ -243,6 +308,8 @@ impl State {
                 return None;
             }
         }
+
+        self.entries.update();
 
         // Create span for this batch to add context to inference calls
         let next_batch_span = info_span!(parent: None, "batch", batch_size = tracing::field::Empty);
