@@ -459,7 +459,7 @@ fn shard_manager(
     let mut envs: Vec<(OsString, OsString)> = env::vars_os().collect();
 
     // Torch Distributed Env vars
-    if  world_size == 1 {
+    if world_size == 1 {
         envs.push(("RANK".into(), rank.to_string().into()));
     }
     envs.push(("WORLD_SIZE".into(), world_size.to_string().into()));
@@ -599,6 +599,7 @@ fn shard_manager(
         // Shard is ready
         if uds.exists() && !ready {
             tracing::info!("Shard ready in {:?}", start_time.elapsed());
+            sleep(Duration::from_millis(2000));
             status_sender.send(ShardStatus::Ready).unwrap();
             ready = true;
         } else if !ready && wait_time.elapsed() > Duration::from_secs(10) {
