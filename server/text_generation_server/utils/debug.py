@@ -1,29 +1,76 @@
 import os
-import glob
 import time
+import threading
+from queue import Queue
+from datetime import datetime
 
-from optimum.habana.utils import to_gb_rounded
-import habana_frameworks.torch as htorch
-
-START_TS = None
+DBG_TRACE_QUEUE = Queue()
 DBG_TRACE_FILENAME = os.environ.get('DBG_TRACE_FILENAME')
-if 'GRAPH_VISUALIZATION' in os.environ:
-    for f in glob.glob('.graph_dumps/*'):
-        os.remove(f)
+DBG_TRACE_THREAD = None
 
 
-def count_hpu_graphs():
-    return len(glob.glob('.graph_dumps/*PreGraph*'))
+def dbg_trace_saver_thread():
+    global DBG_TRACE_THREAD
+    start_ts = None
+    print('{"traceEvents": [', flush=True,
+          file=open(DBG_TRACE_FILENAME+".json", 'w'))
+
+    now = datetime.now()
+    dt_string = now.strftime("%Y-%m-%d %H:%M:%S")
+    print("TGI Logger started on {}".format(dt_string),
+          flush=True, file=open(DBG_TRACE_FILENAME, 'w'))
+    separator = ""
+    last = None
+    while True:
+        e = DBG_TRACE_QUEUE.get()
+        if start_ts is None:
+            start_ts = e['time']
+        e['time'] -= start_ts
+        print("{:.3f} | {} | {}".format(e['time'], e['tag'], e['txt']), flush=True,
+              file=open(DBG_TRACE_FILENAME, 'a'))
+        if last:
+            js = {"pid": 1, "tid": 1, "ph": "X",
+                  "name": last['tag'],
+                  "ts": last['time'] * 1e6,
+                  "dur": (e['time'] - last['time']) * 1e6,
+                  "args": last['txt']
+                  }
+            dur = str((e['time'] - last['time']) * 1e6)
+            ts = str(last['time'] * 1e6)
+            s = separator + '{"pid": 1, "tid": 2, "ph": "X", "name": "' + last['tag'] + '", "ts": ' + \
+                ts + ', "dur": ' + dur + \
+                ', "args": {"txt":"' + last['txt'] + '"}}'
+
+            print(s, flush=True, file=open(DBG_TRACE_FILENAME+".json", 'a'))
+            separator = ","
+            if e['tag'] == "STOP":
+                print("]}", flush=True, file=open(
+                    DBG_TRACE_FILENAME+".json", 'a'))
+                DBG_TRACE_THREAD = None
+                break
+
+        last = e
 
 
 def dbg_trace(tag, txt):
-    global START_TS
+    global DBG_TRACE_THREAD
     if DBG_TRACE_FILENAME is not None and int(os.getenv("RANK", 0)) == 0:
-        if START_TS is None:
-            START_TS = time.perf_counter()
-        time_offset = time.perf_counter() - START_TS
-        mem_stats = htorch.hpu.memory.memory_stats()
-        mem_used = to_gb_rounded(mem_stats['InUse'])
-        max_mem_used = to_gb_rounded(mem_stats['MaxInUse'])
-        print(f'ts:{time_offset:.3f}s g:{count_hpu_graphs()} mu:{mem_used:.1f}GB '
-              f'mmu:{max_mem_used:.1f}GB | {tag} | {txt}', flush=True, file=open(DBG_TRACE_FILENAME, 'a'))
+        if DBG_TRACE_THREAD is None:
+            DBG_TRACE_THREAD = threading.Thread(target=dbg_trace_saver_thread)
+            DBG_TRACE_THREAD.start()
+        event = {"time": time.perf_counter(),
+                 "tag": tag,
+                 "txt": txt}
+        DBG_TRACE_QUEUE.put(event)
+
+
+if __name__ == "__main__":
+    print("Test debug utils")
+    event_names = ["GENERATE", "PREFILL", "CONCAT"]
+    for i in range(12):
+        tag = event_names[i % len(event_names)]
+        print("dbg_trace({}, {})".format(tag, i))
+        dbg_trace(tag, str(i))
+        time.sleep(0.01 * i)
+    DBG_TRACE_QUEUE.put(
+        {"time": time.perf_counter(), "tag": "STOP", "txt": ""})
